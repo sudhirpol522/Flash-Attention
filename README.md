@@ -55,23 +55,15 @@ The first `cuda`-backend call triggers the one-time JIT compile of
 
 ## Kernel notes
 
+- GPT-2 head dimension is 64, so each block uses `blockDim.x == head_dim` and a
+  key-tile size `BK = 64`.
 - Both kernels use the standard flash-attention **online softmax** (running max
   `m`, running denominator `l`, rescaled accumulator) so they are numerically
   stable and never materialize the full attention matrix.
-- `flash_prefill_causal` uses the **FA2 query-outer schedule**: the query tile
-  lives in the grid (`grid = (B, nh, Tr)`, `Br = Bc = 16`), so parallelism grows
-  with sequence length. Each block keeps its tile's `m`/`l`/`O` accumulator in
-  shared memory across the whole key loop (zero HBM round-trips), loops only over
-  key tiles, and stops at the diagonal for causal masking (no wasted
-  upper-triangle work). This fixes the `O(N^2)` HBM traffic and the
-  parallelism-doesn't-grow-with-N problem of the naive query-inner layout.
-- `flash_decode`: grid `(B*nh)`, `blockDim.x == head_dim` (64), the single query
-  attends to all `seqlen` cached keys over key tiles of `BK = 64`.
-- Realistic ceiling: this still runs **fp32 on CUDA cores (scalar)**, while
-  PyTorch SDPA dispatches to FlashAttention-2 in **bf16/fp16 on tensor cores**
-  with vectorized loads. That dtype + tensor-core gap is a fixed ~3-4x that
-  scheduling alone cannot close; the goal here is to remove the algorithmic
-  waste and fix the scaling, not to beat SDPA outright.
+- `flash_prefill_causal`: grid `(B*nh, T)`, each query `qi` attends to keys
+  `0..qi` (causal).
+- `flash_decode`: grid `(B*nh)`, the single query attends to all `seqlen`
+  cached keys.
 
 Correctness is checked against PyTorch SDPA in `benchmark.py` /
 `profile_forward.py` (max abs logit difference well under the fp32 tolerance).
