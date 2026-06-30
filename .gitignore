@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Torch cpp_extension JIT build artifacts
+build/
+*.so
+*.o
+
+# Profiling outputs
+results.csv
+plots/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
