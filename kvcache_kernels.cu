@@ -16,6 +16,8 @@
 // GPT-2 family, so a single warp-pair block (blockDim.x == head_dim) is used.
 static constexpr int BK = 64;
 
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
 // ---------------------------------------------------------------------------
 // append_kv (utility; the Python path writes the cache directly, but this is
 // kept available for completeness / alternative cache-management paths)
@@ -115,75 +117,101 @@ __global__ void flash_decode_kernel(
 // launch: grid(B*nh), block(d), smem = (d + BK) * sizeof(float)
 
 // ---------------------------------------------------------------------------
-// flash_prefill_causal_kernel
+// flash_prefill_causal_v2_kernel  (FA2 query-outer schedule)
 //
-// q, k, v : (B*nh, T, d)
-// o : (B*nh, T, d)
-// One block per (bh, query index qi); blockDim.x == d. Each query attends to
-// keys 0..qi (causal). Same online-softmax math as decode.
+// Q, K, V, O : (B, nh, N, d)
+// The query tile lives in the grid (blockIdx.z), so parallelism grows with N.
+// Each block keeps its tile's m / l / O accumulator in shared memory across the
+// whole key loop (zero HBM round-trips), loops only over key tiles, and stops
+// at the diagonal for causal masking (no wasted upper-triangle work).
 // ---------------------------------------------------------------------------
-template <const int BK_>
-__global__ void flash_prefill_causal_kernel(
-    const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
-    float* __restrict__ o,
-    int T, int d, float scale)
+template <const int Br, const int Bc>
+__global__ void flash_prefill_causal_v2_kernel(
+    const float* __restrict__ Q, const float* __restrict__ K,
+    const float* __restrict__ V, int N, int d, int Tc,
+    float scale, float* __restrict__ O)
 {
-    int bh = blockIdx.x;
-    int qi = blockIdx.y;                    // query position this block owns
-    int tid = threadIdx.x;                 // owns output dim `tid`
+    int tx = threadIdx.x;                  // Br*Bc threads
+    int bx = blockIdx.x, by = blockIdx.y;  // batch, head
+    int i  = blockIdx.z;                   // QUERY TILE  <-- now in the grid
 
-    const float* qp = q + ((size_t)bh * T + qi) * d;
-    const float* kp = k + (size_t)bh * T * d;
-    const float* vp = v + (size_t)bh * T * d;
+    int qkv_off = (bx * gridDim.y * N * d) + (by * N * d);
 
     extern __shared__ float smem[];
-    float* q_s = smem;                     // d
-    float* s_s = q_s + d;                  // BK_
+    float* Qi   = smem;                    // Br*d
+    float* Kj   = Qi + Br * d;             // Bc*d
+    float* Vj   = Kj + Bc * d;             // Bc*d
+    float* Sij  = Vj + Bc * d;             // Br*Bc
+    float* Oi   = Sij + Br * Bc;           // Br*d   (accumulator, stays in smem)
+    float* mi   = Oi + Br * d;             // Br
+    float* li   = mi + Br;                 // Br
+    float* corr = li + Br;                 // Br
 
-    q_s[tid] = qp[tid];
+    int s_row = tx / Bc, s_col = tx % Bc;
+
+    for (int e = tx; e < Br * d; e += Br * Bc) {
+        int row = e / d, col = e % d, gr = i * Br + row;
+        Qi[e] = (gr < N) ? Q[qkv_off + gr * d + col] : 0.f;
+        Oi[e] = 0.f;
+    }
+    if (tx < Br) { mi[tx] = -INFINITY; li[tx] = 0.f; }
     __syncthreads();
 
-    float m_i = -INFINITY, l_i = 0.f, acc = 0.f;
-    int seq = qi + 1;                      // causal: attend to keys 0..qi
+    int q_last = min(i * Br + Br - 1, N - 1);
+    int j_max  = q_last / Bc;              // causal: never touch future key tiles
 
-    for (int j0 = 0; j0 < seq; j0 += BK_) {
-        for (int jj = tid; jj < BK_; jj += blockDim.x) {
-            int j = j0 + jj;
-            float dot = -INFINITY;
-            if (j < seq) {
-                dot = 0.f;
-                const float* kj = kp + (size_t)j * d;
-                for (int e = 0; e < d; e++) dot += q_s[e] * kj[e];
-                dot *= scale;
-            }
-            s_s[jj] = dot;
+    for (int j = 0; j <= j_max; j++) {
+        for (int e = tx; e < Bc * d; e += Br * Bc) {
+            int row = e / d, col = e % d, gk = j * Bc + row;
+            Kj[e] = (gk < N) ? K[qkv_off + gk * d + col] : 0.f;
+            Vj[e] = (gk < N) ? V[qkv_off + gk * d + col] : 0.f;
         }
         __syncthreads();
 
-        float m_tile = -INFINITY;
-        for (int jj = 0; jj < BK_; jj++) m_tile = fmaxf(m_tile, s_s[jj]);
-        float m_new = fmaxf(m_i, m_tile);
-        float corr  = __expf(m_i - m_new);
-        acc *= corr;
+        int q_pos = i * Br + s_row, k_pos = j * Bc + s_col;
+        float acc = 0.f;
+        for (int k = 0; k < d; k++) acc += Qi[s_row * d + k] * Kj[s_col * d + k];
+        acc *= scale;
+        if (k_pos > q_pos || k_pos >= N) acc = -INFINITY;   // causal mask in diagonal tile
+        Sij[s_row * Bc + s_col] = acc;
+        __syncthreads();
 
-        float l_tile = 0.f;
-        for (int jj = 0; jj < BK_; jj++) {
-            int j = j0 + jj;
-            if (j < seq) {
-                float p = __expf(s_s[jj] - m_new);
+        if (s_col == 0) {                                   // online softmax, one thread/row
+            float m_old = mi[s_row], m_tile = -INFINITY;
+            for (int c = 0; c < Bc; c++) m_tile = fmaxf(m_tile, Sij[s_row * Bc + c]);
+            float m_new = fmaxf(m_old, m_tile);
+            float c_old = (m_old == -INFINITY) ? 0.f : __expf(m_old - m_new);
+            float l_tile = 0.f;
+            for (int c = 0; c < Bc; c++) {
+                float p = (Sij[s_row * Bc + c] == -INFINITY) ? 0.f
+                                                             : __expf(Sij[s_row * Bc + c] - m_new);
+                Sij[s_row * Bc + c] = p;
                 l_tile += p;
-                acc += p * vp[(size_t)j * d + tid];
             }
+            li[s_row]   = li[s_row] * c_old + l_tile;
+            mi[s_row]   = m_new;
+            corr[s_row] = c_old;
         }
-        l_i = l_i * corr + l_tile;
-        m_i = m_new;
+        __syncthreads();
+
+        for (int col = s_col; col < d; col += Bc) {         // Oi = corr*Oi + P·Vj
+            float pv = 0.f;
+            for (int c = 0; c < Bc; c++) pv += Sij[s_row * Bc + c] * Vj[c * d + col];
+            Oi[s_row * d + col] = Oi[s_row * d + col] * corr[s_row] + pv;
+        }
         __syncthreads();
     }
-    o[((size_t)bh * T + qi) * d + tid] = acc / l_i;
+
+    for (int col = s_col; col < d; col += Bc) {             // write once, normalized
+        int gr = i * Br + s_row;
+        if (gr < N) {
+            float denom = (li[s_row] > 0.f) ? li[s_row] : 1.f;
+            O[qkv_off + gr * d + col] = Oi[s_row * d + col] / denom;
+        }
+    }
 }
-// launch: grid(B*nh, T), block(d), smem = (d + BK) * sizeof(float)
+// launch: grid(B, nh, Tr), block(Br*Bc),
+//         smem = (Br*d + 2*Bc*d + Br*Bc + Br*d + 3*Br) * sizeof(float)
 
 // ===========================================================================
 // Host wrappers (Python-facing)
@@ -192,29 +220,29 @@ __global__ void flash_prefill_causal_kernel(
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_F32(x)  TORCH_CHECK((x).scalar_type() == at::kFloat, #x " must be float32")
 
-// q, k, v : (B, nh, T, hd) contiguous fp32 CUDA -> y : (B, nh, T, hd)
-torch::Tensor flash_prefill_causal(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
-    CHECK_CUDA(q); CHECK_CUDA(k); CHECK_CUDA(v);
-    CHECK_F32(q);  CHECK_F32(k);  CHECK_F32(v);
-    q = q.contiguous(); k = k.contiguous(); v = v.contiguous();
+// Q, K, V : (B, nh, N, hd) contiguous fp32 CUDA -> O : (B, nh, N, hd)
+// FA2 query-outer schedule: grid is (B, nh, Tr) so parallelism grows with N.
+torch::Tensor flash_prefill_causal(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    CHECK_CUDA(Q); CHECK_CUDA(K); CHECK_CUDA(V);
+    CHECK_F32(Q);  CHECK_F32(K);  CHECK_F32(V);
+    Q = Q.contiguous(); K = K.contiguous(); V = V.contiguous();
 
-    int B  = q.size(0);
-    int nh = q.size(1);
-    int T  = q.size(2);
-    int d  = q.size(3);
-    TORCH_CHECK(d == BK, "head_dim must equal BK (", BK, "); got ", d);
+    const int Br = 16, Bc = 16;
+    int B  = Q.size(0);
+    int nh = Q.size(1);
+    int N  = Q.size(2);
+    int d  = Q.size(3);
+    int Tr = CEIL_DIV(N, Br), Tc = CEIL_DIV(N, Bc);
 
-    auto o = torch::empty_like(q);
+    auto O = torch::zeros_like(Q);
     float scale = 1.0f / std::sqrt((float)d);
+    size_t smem = (size_t)(Br * d + 2 * Bc * d + Br * Bc + Br * d + 3 * Br) * sizeof(float);
 
-    dim3 grid(B * nh, T);
-    dim3 block(d);
-    size_t smem = (size_t)(d + BK) * sizeof(float);
-
-    flash_prefill_causal_kernel<BK><<<grid, block, smem>>>(
-        q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
-        o.data_ptr<float>(), T, d, scale);
-    return o;
+    dim3 grid(B, nh, Tr), block(Br * Bc);
+    flash_prefill_causal_v2_kernel<Br, Bc><<<grid, block, smem>>>(
+        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+        N, d, Tc, scale, O.data_ptr<float>());
+    return O;
 }
 
 // q : (B, nh, hd);  k_cache/v_cache : (B, nh, max_len, hd) -> y : (B, nh, hd)
